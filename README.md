@@ -57,6 +57,7 @@ Original zeros scoring:
 ## Benchmarks (indicative)
 | GPU  | Normal addresses | Contract addresses | CREATE2 addresses |
 | ---- | ---------------- | ------------------ | ----------------- |
+| 5090 | 5600M/s          | 2800M/s            | -                 |
 | 4090 | 3800M/s          | 2050M/s            | 4800M/s           |
 | 3090 | 1600M/s          | 850M/s             | 2300M/s           |
 | 3070 | 1000M/s          | 550M/s             | 1300M/s           |
