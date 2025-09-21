@@ -29,6 +29,7 @@
 #include <chrono>
 #include <fstream>
 #include <vector>
+#include <cstring>
 
 #include "secure_rand.h"
 #include "structures.h"
@@ -48,6 +49,13 @@
 __constant__ CurvePoint thread_offsets[BLOCK_SIZE];
 __constant__ CurvePoint addends[THREAD_WORK - 1];
 __device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
+__constant__ uint64_t pattern_values[8];  // Support up to 8 patterns
+__constant__ int pattern_bytes[8];        // Bytes for each pattern
+__constant__ int num_patterns;            // Number of active patterns
+__constant__ uint64_t dictionary_patterns[1000];  // Dictionary patterns
+__constant__ int dictionary_bytes[1000];          // Bytes for each dictionary pattern
+__constant__ int num_dictionary_patterns;         // Number of dictionary patterns
+__constant__ bool use_dictionary;                 // Whether to use dictionary mode
 
 __device__ int count_zero_bytes(uint32_t x) {
     int n = 0;
@@ -89,6 +97,62 @@ __device__ int score_leading_zeros(Address a) {
     return n >> 3;
 }
 
+// Multi-pattern matching scoring function
+__device__ int score_pattern_match(Address a) {
+    // Extract the first 8 bytes of the address for pattern matching
+    uint64_t addr_prefix = ((uint64_t)a.a << 32) | ((uint64_t)a.b >> 32);
+    
+    int best_matches = 0;
+    
+    if (use_dictionary) {
+        // Check dictionary patterns
+        for (int p = 0; p < num_dictionary_patterns; p++) {
+            uint64_t pattern = dictionary_patterns[p];
+            int pattern_len = dictionary_bytes[p];
+            int matches = 0;
+            uint64_t mask = 0xFF00000000000000ULL;
+            
+            for (int i = 0; i < pattern_len && i < 8; i++) {
+                if ((addr_prefix & mask) == (pattern & mask)) {
+                    matches++;
+                } else {
+                    break; // Stop at first mismatch
+                }
+                mask >>= 8;
+                pattern <<= 8;
+            }
+            
+            if (matches > best_matches) {
+                best_matches = matches;
+            }
+        }
+    } else {
+        // Check specific patterns
+        for (int p = 0; p < num_patterns; p++) {
+            uint64_t pattern = pattern_values[p];
+            int pattern_len = pattern_bytes[p];
+            int matches = 0;
+            uint64_t mask = 0xFF00000000000000ULL;
+            
+            for (int i = 0; i < pattern_len && i < 8; i++) {
+                if ((addr_prefix & mask) == (pattern & mask)) {
+                    matches++;
+                } else {
+                    break; // Stop at first mismatch
+                }
+                mask >>= 8;
+                pattern <<= 8;
+            }
+            
+            if (matches > best_matches) {
+                best_matches = matches;
+            }
+        }
+    }
+    
+    return best_matches;
+}
+
 #ifdef __linux__
     #define atomicMax_ul(a, b) atomicMax((unsigned long long*)(a), (unsigned long long)(b))
     #define atomicAdd_ul(a, b) atomicAdd((unsigned long long*)(a), (unsigned long long)(b))
@@ -101,6 +165,7 @@ __device__ void handle_output(int score_method, Address a, uint64_t key, bool in
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
+    else if (score_method == 2) { score = score_pattern_match(a); }
 
     if (score >= device_memory[1]) {
         atomicMax_ul(&device_memory[1], score);
@@ -119,6 +184,7 @@ __device__ void handle_output2(int score_method, Address a, uint64_t key) {
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
+    else if (score_method == 2) { score = score_pattern_match(a); }
 
     if (score >= device_memory[1]) {
         atomicMax_ul(&device_memory[1], score);
@@ -203,6 +269,18 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
     output_counter_host[0] = 0;
     max_score_host[0] = 2;
     gpu_assert(cudaMemcpyToSymbol(device_memory, device_memory_host, 2 * sizeof(uint64_t)));
+    
+    // Copy pattern values to constant memory if using pattern matching
+    if (score_method == 2) {
+        gpu_assert(cudaMemcpyToSymbol(pattern_values, pattern_values, 8 * sizeof(uint64_t)));
+        gpu_assert(cudaMemcpyToSymbol(pattern_bytes, pattern_bytes, 8 * sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(num_patterns, &num_patterns, sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(dictionary_patterns, dictionary_patterns, 1000 * sizeof(uint64_t)));
+        gpu_assert(cudaMemcpyToSymbol(dictionary_bytes, dictionary_bytes, 1000 * sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(num_dictionary_patterns, &num_dictionary_patterns, sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(use_dictionary, &use_dictionary, sizeof(bool)));
+    }
+    
     gpu_assert(cudaDeviceSynchronize())
 
 
@@ -528,11 +606,18 @@ void print_speeds(int num_devices, int* device_ids, double* speeds) {
 
 
 int main(int argc, char *argv[]) {
-    int score_method = -1; // 0 = leading zeroes, 1 = zeros
+    int score_method = -1; // 0 = leading zeroes, 1 = zeros, 2 = pattern matching
     int mode = 0; // 0 = address, 1 = contract, 2 = create2 contract, 3 = create3 proxy contract
     char* input_file = 0;
     char* input_address = 0;
     char* input_deployer_address = 0;
+    uint64_t pattern_values[8] = {0};
+    int pattern_bytes[8] = {0};
+    int num_patterns = 0;
+    uint64_t dictionary_patterns[1000] = {0};
+    int dictionary_bytes[1000] = {0};
+    int num_dictionary_patterns = 0;
+    bool use_dictionary = false;
 
     int num_devices = 0;
     int device_ids[10];
@@ -546,6 +631,67 @@ int main(int argc, char *argv[]) {
             i++;
         } else if (strcmp(argv[i], "--zeros") == 0 || strcmp(argv[i], "-z") == 0) {
             score_method = 1;
+            i++;
+        } else if (strcmp(argv[i], "--pattern") == 0 || strcmp(argv[i], "-p") == 0) {
+            score_method = 2;
+            // Parse the pattern (e.g., "a1decaf")
+            if (i + 1 >= argc) {
+                printf("Pattern required after --pattern\n");
+                return 1;
+            }
+            if (num_patterns >= 8) {
+                printf("Maximum 8 patterns allowed\n");
+                return 1;
+            }
+            char* pattern_str = argv[i + 1];
+            int len = strlen(pattern_str);
+            if (len > 16) {
+                printf("Pattern too long (max 16 hex characters)\n");
+                return 1;
+            }
+            // Convert hex string to uint64_t
+            pattern_values[num_patterns] = 0;
+            pattern_bytes[num_patterns] = len / 2;
+            for (int j = 0; j < len; j += 2) {
+                char byte_str[3] = {pattern_str[j], pattern_str[j+1], 0};
+                uint64_t byte_val = strtoul(byte_str, NULL, 16);
+                pattern_values[num_patterns] = (pattern_values[num_patterns] << 8) | byte_val;
+            }
+            num_patterns++;
+            i += 2;
+        } else if (strcmp(argv[i], "--dictionary") == 0 || strcmp(argv[i], "-dict") == 0) {
+            score_method = 2;
+            use_dictionary = true;
+            // Load dictionary from file
+            FILE* dict_file = fopen("hex-words-dictionary.txt", "r");
+            if (dict_file == NULL) {
+                printf("Could not open hex-words-dictionary.txt\n");
+                return 1;
+            }
+            
+            char line[256];
+            while (fgets(line, sizeof(line), dict_file) && num_dictionary_patterns < 1000) {
+                // Skip comments and empty lines
+                if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+                
+                // Remove newline
+                line[strcspn(line, "\r\n")] = 0;
+                
+                int len = strlen(line);
+                if (len > 0 && len <= 16) {
+                    // Convert hex string to uint64_t
+                    dictionary_patterns[num_dictionary_patterns] = 0;
+                    dictionary_bytes[num_dictionary_patterns] = len / 2;
+                    for (int j = 0; j < len; j += 2) {
+                        char byte_str[3] = {line[j], line[j+1], 0};
+                        uint64_t byte_val = strtoul(byte_str, NULL, 16);
+                        dictionary_patterns[num_dictionary_patterns] = (dictionary_patterns[num_dictionary_patterns] << 8) | byte_val;
+                    }
+                    num_dictionary_patterns++;
+                }
+            }
+            fclose(dict_file);
+            printf("Loaded %d dictionary patterns\n", num_dictionary_patterns);
             i++;
         } else if (strcmp(argv[i], "--contract") == 0 || strcmp(argv[i], "-c") == 0) {
             mode = 1;
@@ -575,6 +721,28 @@ int main(int argc, char *argv[]) {
 
     if (num_devices == 0) {
         printf("No devices were specified\n");
+        printf("Usage: ./vanity-eth-address [PARAMETERS]\n");
+        printf("    Scoring methods:\n");
+        printf("      (-lz) --leading-zeros               Count zero bytes at the start of the address\n");
+        printf("       (-z) --zeros                       Count zero bytes anywhere in the address\n");
+        printf("       (-p) --pattern <hex_pattern>       Match specific hex pattern (e.g., a1decaf) - can use multiple times\n");
+        printf("       (-dict) --dictionary               Use dictionary of hex words (loads from hex-words-dictionary.txt)\n");
+        printf("    Modes (normal addresses by default):\n");
+        printf("       (-c) --contract                    Search for addresses and score the contract address generated using nonce=0\n");
+        printf("      (-c2) --contract2                   Search for contract addresses using the CREATE2 opcode\n");
+        printf("      (-c3) --contract3                   Search for contract addresses using a CREATE3 proxy deployer\n");
+        printf("    Other:\n");
+        printf("       (-d) --device <device_number>      Use device <device_number> (Add one for each device for multi-gpu)\n");
+        printf("       (-b) --bytecode <filename>         File containing contract bytecode (only needed when using --contract2 or --contract3)\n");
+        printf("       (-a) --address <address>           Sender contract address (only needed when using --contract2 or --contract3)\n");
+        printf("      (-ad) --deployer-address <address>  Deployer contract address (only needed when using --contract3)\n");
+        printf("       (-w) --work-scale <num>            Defaults to 15. Scales the work done in each kernel.\n");
+        printf("\nExamples:\n");
+        printf("    ./vanity-eth-address --pattern a1decaf --device 0\n");
+        printf("    ./vanity-eth-address --pattern a1decaf --pattern a1c0ffee --pattern a1c0de --device 0\n");
+        printf("    ./vanity-eth-address --dictionary --device 0\n");
+        printf("    ./vanity-eth-address --pattern a1c0ffee --contract --device 0\n");
+        printf("    ./vanity-eth-address --leading-zeros --device 0 --device 2 --work-scale 17\n");
         return 1;
     }
 
