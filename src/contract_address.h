@@ -29,8 +29,14 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_contract_address_work(int s
 
     CurvePoint p = offsets[thread_id];
 
-    handle_output(score_method, calculate_contract_address(calculate_address(p.x, p.y)), key, 0);
-    handle_output(score_method, calculate_contract_address(calculate_address(p.x, sub_256(P, p.y))), key, 1);
+    // Test 4 nonces (0, 1, 2, 3) for each address
+    Address addr1 = calculate_address(p.x, p.y);
+    Address addr2 = calculate_address(p.x, sub_256(P, p.y));
+    
+    for (int nonce = 0; nonce < 4; nonce++) {
+        handle_output(score_method, calculate_contract_address(addr1, nonce), key, 0, nonce);
+        handle_output(score_method, calculate_contract_address(addr2, nonce), key, 1, nonce);
+    }
 
 
     _uint256 z[THREAD_WORK - 1];
@@ -51,8 +57,14 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_contract_address_work(int s
         _uint256 curve_x = sub_256_mod_p(sub_256_mod_p(mul_256_mod_p(lambda, lambda), p.x), addends[i].x);
         _uint256 curve_y = sub_256_mod_p(mul_256_mod_p(lambda, sub_256_mod_p(p.x, curve_x)), p.y);
 
-        handle_output(score_method, calculate_contract_address(calculate_address(curve_x, curve_y)), key + i + 1, 0);
-        handle_output(score_method, calculate_contract_address(calculate_address(curve_x, sub_256(P, curve_y))), key + i + 1, 1);
+        // Test 4 nonces for each address in the loop
+        Address addr_loop1 = calculate_address(curve_x, curve_y);
+        Address addr_loop2 = calculate_address(curve_x, sub_256(P, curve_y));
+        
+        for (int nonce = 0; nonce < 4; nonce++) {
+            handle_output(score_method, calculate_contract_address(addr_loop1, nonce), key + i + 1, 0, nonce);
+            handle_output(score_method, calculate_contract_address(addr_loop2, nonce), key + i + 1, 1, nonce);
+        }
     }
 
     _uint256 y = q;
@@ -61,6 +73,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_contract_address_work(int s
     _uint256 curve_x = sub_256_mod_p(sub_256_mod_p(mul_256_mod_p(lambda, lambda), p.x), addends[0].x);
     _uint256 curve_y = sub_256_mod_p(mul_256_mod_p(lambda, sub_256_mod_p(p.x, curve_x)), p.y);
 
-    handle_output(score_method, calculate_contract_address(calculate_address(curve_x, curve_y)), key + 1, 0);
-    handle_output(score_method, calculate_contract_address(calculate_address(curve_x, sub_256(P, curve_y))), key + 1, 1);
+    // Test 4 nonces for the final addresses
+    Address addr_final1 = calculate_address(curve_x, curve_y);
+    Address addr_final2 = calculate_address(curve_x, sub_256(P, curve_y));
+    
+    for (int nonce = 0; nonce < 4; nonce++) {
+        handle_output(score_method, calculate_contract_address(addr_final1, nonce), key + 1, 0, nonce);
+        handle_output(score_method, calculate_contract_address(addr_final2, nonce), key + 1, 1, nonce);
+    }
 }

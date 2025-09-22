@@ -48,7 +48,7 @@
 
 __constant__ CurvePoint thread_offsets[BLOCK_SIZE];
 __constant__ CurvePoint addends[THREAD_WORK - 1];
-__device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
+__device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 4];
 __constant__ uint64_t pattern_values[8];  // Support up to 8 patterns
 __constant__ int pattern_bytes[8];        // Bytes for each pattern
 __constant__ int num_patterns;            // Number of active patterns
@@ -100,48 +100,42 @@ __device__ int score_leading_zeros(Address a) {
 // Multi-pattern matching scoring function
 __device__ int score_pattern_match(Address a) {
     // Extract the first 8 bytes of the address for pattern matching
-    uint64_t addr_prefix = ((uint64_t)a.a << 32) | ((uint64_t)a.b >> 32);
+    // Address format: a.a is first 4 bytes, a.b is second 4 bytes
+    uint64_t addr_prefix = ((uint64_t)a.a << 32) | ((uint64_t)a.b);
     
     int best_matches = 0;
     
     if (use_dictionary) {
-        // Check dictionary patterns
+        // Check dictionary patterns - ONLY return score for complete word matches
         for (int p = 0; p < num_dictionary_patterns; p++) {
             uint64_t pattern = dictionary_patterns[p];
             int pattern_len = dictionary_bytes[p];
-            int matches = 0;
-            uint64_t mask = 0xFF00000000000000ULL;
             
-            for (int i = 0; i < pattern_len && i < 8; i++) {
-                if ((addr_prefix & mask) == (pattern & mask)) {
-                    matches++;
-                } else {
-                    break; // Stop at first mismatch
-                }
-                mask >>= 8;
-                pattern <<= 8;
-            }
+            // Extract address bytes from the beginning
+            uint64_t addr_shifted = addr_prefix >> (64 - pattern_len * 8);
             
-            if (matches > best_matches) {
-                best_matches = matches;
+            // Check for exact match (pattern is already in the low bits)
+            if (addr_shifted == pattern && pattern_len > best_matches) {
+                best_matches = pattern_len;
             }
         }
     } else {
-        // Check specific patterns
+        // Check specific patterns - allow partial matches for regular patterns
         for (int p = 0; p < num_patterns; p++) {
             uint64_t pattern = pattern_values[p];
             int pattern_len = pattern_bytes[p];
             int matches = 0;
-            uint64_t mask = 0xFF00000000000000ULL;
             
+            // Byte-by-byte comparison from the start
             for (int i = 0; i < pattern_len && i < 8; i++) {
-                if ((addr_prefix & mask) == (pattern & mask)) {
+                uint8_t addr_byte = (addr_prefix >> (56 - i * 8)) & 0xFF;
+                uint8_t pattern_byte = (pattern >> (pattern_len - 1 - i) * 8) & 0xFF;
+                
+                if (addr_byte == pattern_byte) {
                     matches++;
                 } else {
-                    break; // Stop at first mismatch
+                    break;
                 }
-                mask >>= 8;
-                pattern <<= 8;
             }
             
             if (matches > best_matches) {
@@ -161,7 +155,7 @@ __device__ int score_pattern_match(Address a) {
     #define atomicAdd_ul(a, b) atomicAdd(a, b)
 #endif
 
-__device__ void handle_output(int score_method, Address a, uint64_t key, bool inv) {
+__device__ void handle_output(int score_method, Address a, uint64_t key, bool inv, int nonce = -1) {
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
@@ -175,12 +169,13 @@ __device__ void handle_output(int score_method, Address a, uint64_t key, bool in
                 device_memory[2 + idx] = key;
                 device_memory[OUTPUT_BUFFER_SIZE + 2 + idx] = score;
                 device_memory[OUTPUT_BUFFER_SIZE * 2 + 2 + idx] = inv;
+                device_memory[OUTPUT_BUFFER_SIZE * 3 + 2 + idx] = nonce;
             }
         }
     }
 }
 
-__device__ void handle_output2(int score_method, Address a, uint64_t key) {
+__device__ void handle_output2(int score_method, Address a, uint64_t key, int nonce = -1) {
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
@@ -193,6 +188,8 @@ __device__ void handle_output2(int score_method, Address a, uint64_t key) {
             if (idx < OUTPUT_BUFFER_SIZE) {
                 device_memory[2 + idx] = key;
                 device_memory[OUTPUT_BUFFER_SIZE + 2 + idx] = score;
+                device_memory[OUTPUT_BUFFER_SIZE * 2 + 2 + idx] = 0;  // inv (not used in handle_output2)
+                device_memory[OUTPUT_BUFFER_SIZE * 3 + 2 + idx] = nonce;
             }
         }
     }
@@ -219,6 +216,7 @@ struct Message {
     int results_count;
     _uint256* results;
     int* scores;
+    int* nonces;
 };
 
 std::queue<Message> message_queue;
@@ -258,15 +256,17 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
     uint64_t* output_buffer_host;
     uint64_t* output_buffer2_host;
     uint64_t* output_buffer3_host;
+    uint64_t* output_buffer4_host;
 
     gpu_assert(cudaSetDevice(device));
 
-    gpu_assert(cudaHostAlloc(&device_memory_host, (2 + OUTPUT_BUFFER_SIZE * 3) * sizeof(uint64_t), cudaHostAllocDefault))
+    gpu_assert(cudaHostAlloc(&device_memory_host, (2 + OUTPUT_BUFFER_SIZE * 4) * sizeof(uint64_t), cudaHostAllocDefault))
     output_counter_host = device_memory_host;
     max_score_host = device_memory_host + 1;
     output_buffer_host = max_score_host + 1;
     output_buffer2_host = output_buffer_host + OUTPUT_BUFFER_SIZE;
     output_buffer3_host = output_buffer2_host + OUTPUT_BUFFER_SIZE;
+    output_buffer4_host = output_buffer3_host + OUTPUT_BUFFER_SIZE;
 
     output_counter_host[0] = 0;
     max_score_host[0] = 2;
@@ -390,7 +390,7 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
 
             gpu_address_init<<<GRID_SIZE/BLOCK_SIZE, BLOCK_SIZE, 0, streams[0]>>>(block_offsets, offsets);
             if (!first_iteration) {
-                gpu_assert(cudaMemcpyFromSymbolAsync(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 3) * sizeof(uint64_t), 0, cudaMemcpyDeviceToHost, streams[1]))
+                gpu_assert(cudaMemcpyFromSymbolAsync(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 4) * sizeof(uint64_t), 0, cudaMemcpyDeviceToHost, streams[1]))
                 gpu_assert(cudaStreamSynchronize(streams[1]))
             }
             if (!first_iteration) {
@@ -416,6 +416,7 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                     if (valid_results > 0) {
                         _uint256* results = new _uint256[valid_results];
                         int* scores = new int[valid_results];
+                        int* nonces = new int[valid_results];
                         valid_results = 0;
 
                         for (int i = 0; i < output_counter_host[0]; i++) {
@@ -427,23 +428,24 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                             if (output_buffer3_host[i]) {
                                 k = cpu_sub_256(N, k);
                             }
-                
+
                             int idx = valid_results++;
                             results[idx] = k;
                             scores[idx] = output_buffer2_host[i];
+                            nonces[idx] = output_buffer4_host[i];
                         }
 
                         message_queue_mutex.lock();
-                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, valid_results, results, scores});
+                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, valid_results, results, scores, nonces});
                         message_queue_mutex.unlock();
                     } else {
                         message_queue_mutex.lock();
-                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0});
+                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0, nullptr, nullptr, nullptr});
                         message_queue_mutex.unlock();
                     }
                 } else {
                     message_queue_mutex.lock();
-                    message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0});
+                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0, nullptr, nullptr, nullptr});
                     message_queue_mutex.unlock();
                 }
             }
@@ -464,7 +466,7 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
             gpu_contract2_address_work<<<GRID_SIZE, BLOCK_SIZE>>>(score_method, origin_address, random_key, bytecode);
 
             gpu_assert(cudaDeviceSynchronize())
-            gpu_assert(cudaMemcpyFromSymbol(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 3) * sizeof(uint64_t)))
+            gpu_assert(cudaMemcpyFromSymbol(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 4) * sizeof(uint64_t)))
 
             uint64_t end_time = milliseconds();
             double elapsed = (end_time - start_time) / 1000.0;
@@ -491,6 +493,7 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                 if (valid_results > 0) {
                     _uint256* results = new _uint256[valid_results];
                     int* scores = new int[valid_results];
+                    int* nonces = new int[valid_results];
                     valid_results = 0;
 
                     for (int i = 0; i < output_counter_host[0]; i++) {
@@ -502,19 +505,20 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                         int idx = valid_results++;
                         results[idx] = k;
                         scores[idx] = output_buffer2_host[i];
+                        nonces[idx] = output_buffer4_host[i];
                     }
 
                     message_queue_mutex.lock();
-                    message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, valid_results, results, scores});
+                    message_queue.push(Message{end_time, 2, device_index, cudaSuccess, speed, valid_results, results, scores, nonces});
                     message_queue_mutex.unlock();
                 } else {
                     message_queue_mutex.lock();
-                    message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0});
+                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0, nullptr, nullptr, nullptr});
                     message_queue_mutex.unlock();
                 }
             } else {
                 message_queue_mutex.lock();
-                message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0});
+                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0, nullptr, nullptr, nullptr});
                 message_queue_mutex.unlock();
             }
 
@@ -531,7 +535,7 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
             gpu_contract3_address_work<<<GRID_SIZE, BLOCK_SIZE>>>(score_method, origin_address, deployer_address, random_key, bytecode);
 
             gpu_assert(cudaDeviceSynchronize())
-            gpu_assert(cudaMemcpyFromSymbol(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 3) * sizeof(uint64_t)))
+            gpu_assert(cudaMemcpyFromSymbol(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 4) * sizeof(uint64_t)))
 
             uint64_t end_time = milliseconds();
             double elapsed = (end_time - start_time) / 1000.0;
@@ -558,6 +562,7 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                 if (valid_results > 0) {
                     _uint256* results = new _uint256[valid_results];
                     int* scores = new int[valid_results];
+                    int* nonces = new int[valid_results];
                     valid_results = 0;
 
                     for (int i = 0; i < output_counter_host[0]; i++) {
@@ -569,19 +574,20 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                         int idx = valid_results++;
                         results[idx] = k;
                         scores[idx] = output_buffer2_host[i];
+                        nonces[idx] = output_buffer4_host[i];
                     }
 
                     message_queue_mutex.lock();
-                    message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, valid_results, results, scores});
+                    message_queue.push(Message{end_time, 3, device_index, cudaSuccess, speed, valid_results, results, scores, nonces});
                     message_queue_mutex.unlock();
                 } else {
                     message_queue_mutex.lock();
-                    message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0});
+                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0, nullptr, nullptr, nullptr});
                     message_queue_mutex.unlock();
                 }
             } else {
                 message_queue_mutex.lock();
-                message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0});
+                        message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0, nullptr, nullptr, nullptr});
                 message_queue_mutex.unlock();
             }
 
@@ -693,7 +699,10 @@ int main(int argc, char *argv[]) {
                 }
             }
             fclose(dict_file);
-            printf("Loaded %d dictionary patterns\n", num_dictionary_patterns);
+            printf("Loaded %d dictionary patterns:\n", num_dictionary_patterns);
+            for (int i = 0; i < num_dictionary_patterns; i++) {
+                printf("  Pattern %d: 0x%016lx (%d bytes)\n", i, dictionary_patterns[i], dictionary_bytes[i]);
+            }
             i++;
         } else if (strcmp(argv[i], "--contract") == 0 || strcmp(argv[i], "-c") == 0) {
             mode = 1;
@@ -918,32 +927,36 @@ int main(int argc, char *argv[]) {
                                 addresses[i] = cpu_calculate_address(p.x, p.y);
                             } else if (mode == 1) {
                                 CurvePoint p = cpu_point_multiply(G, m.results[i]);
-                                addresses[i] = cpu_calculate_contract_address(cpu_calculate_address(p.x, p.y));
+                                addresses[i] = cpu_calculate_contract_address(cpu_calculate_address(p.x, p.y), m.nonces[i]);
                             } else if (mode == 2) {
                                 addresses[i] = cpu_calculate_contract_address2(origin_address, m.results[i], bytecode_hash);
                             } else if (mode == 3) {
                                 _uint256 salt = cpu_calculate_create3_salt(origin_address, m.results[i]);
                                 Address proxy = cpu_calculate_contract_address2(deployer_address, salt, bytecode_hash);
-                                addresses[i] = cpu_calculate_contract_address(proxy, 1);
+                                addresses[i] = cpu_calculate_contract_address(proxy, m.nonces[i]);
                             }
                         }
 
                         for (int i = 0; i < m.results_count; i++) {
                             _uint256 k = m.results[i];
                             int score = m.scores[i];
+                            int nonce = m.nonces[i];
                             Address a = addresses[i];
                             uint64_t time = (m.time - global_start_time) / 1000;
 
-                            if (mode == 0 || mode == 1) {
+                            if (mode == 0) {
                                 printf("Elapsed: %06u Score: %02u Private Key: 0x%08x%08x%08x%08x%08x%08x%08x%08x Address: 0x%08x%08x%08x%08x%08x\n", (uint32_t)time, score, k.a, k.b, k.c, k.d, k.e, k.f, k.g, k.h, a.a, a.b, a.c, a.d, a.e);
+                            } else if (mode == 1) {
+                                printf("Elapsed: %06u Score: %02u Nonce: %02u Private Key: 0x%08x%08x%08x%08x%08x%08x%08x%08x Address: 0x%08x%08x%08x%08x%08x\n", (uint32_t)time, score, nonce, k.a, k.b, k.c, k.d, k.e, k.f, k.g, k.h, a.a, a.b, a.c, a.d, a.e);
                             } else if (mode == 2 || mode == 3) {
-                                printf("Elapsed: %06u Score: %02u Salt: 0x%08x%08x%08x%08x%08x%08x%08x%08x Address: 0x%08x%08x%08x%08x%08x\n", (uint32_t)time, score, k.a, k.b, k.c, k.d, k.e, k.f, k.g, k.h, a.a, a.b, a.c, a.d, a.e);
+                                printf("Elapsed: %06u Score: %02u Nonce: %02u Salt: 0x%08x%08x%08x%08x%08x%08x%08x%08x Address: 0x%08x%08x%08x%08x%08x\n", (uint32_t)time, score, nonce, k.a, k.b, k.c, k.d, k.e, k.f, k.g, k.h, a.a, a.b, a.c, a.d, a.e);
                             }
                         }
 
                         delete[] addresses;
                         delete[] m.results;
                         delete[] m.scores;
+                        delete[] m.nonces;
                     }
                     print_speeds(num_devices, device_ids, speeds);
                     fflush(stdout);
