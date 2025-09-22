@@ -243,7 +243,9 @@ uint64_t milliseconds() {
 }
 
 
-void host_thread(int device, int device_index, int score_method, int mode, Address origin_address, Address deployer_address, _uint256 bytecode) {
+void host_thread(int device, int device_index, int score_method, int mode, Address origin_address, Address deployer_address, _uint256 bytecode, 
+                 uint64_t* host_pattern_values, int* host_pattern_bytes, int host_num_patterns,
+                 uint64_t* host_dictionary_patterns, int* host_dictionary_bytes, int host_num_dictionary_patterns, bool host_use_dictionary) {
     uint64_t GRID_WORK = ((uint64_t)BLOCK_SIZE * (uint64_t)GRID_SIZE * (uint64_t)THREAD_WORK);
 
     CurvePoint* block_offsets = 0;
@@ -272,13 +274,13 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
     
     // Copy pattern values to constant memory if using pattern matching
     if (score_method == 2) {
-        gpu_assert(cudaMemcpyToSymbol(pattern_values, pattern_values, 8 * sizeof(uint64_t)));
-        gpu_assert(cudaMemcpyToSymbol(pattern_bytes, pattern_bytes, 8 * sizeof(int)));
-        gpu_assert(cudaMemcpyToSymbol(num_patterns, &num_patterns, sizeof(int)));
-        gpu_assert(cudaMemcpyToSymbol(dictionary_patterns, dictionary_patterns, 1000 * sizeof(uint64_t)));
-        gpu_assert(cudaMemcpyToSymbol(dictionary_bytes, dictionary_bytes, 1000 * sizeof(int)));
-        gpu_assert(cudaMemcpyToSymbol(num_dictionary_patterns, &num_dictionary_patterns, sizeof(int)));
-        gpu_assert(cudaMemcpyToSymbol(use_dictionary, &use_dictionary, sizeof(bool)));
+        gpu_assert(cudaMemcpyToSymbol(pattern_values, host_pattern_values, 8 * sizeof(uint64_t)));
+        gpu_assert(cudaMemcpyToSymbol(pattern_bytes, host_pattern_bytes, 8 * sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(num_patterns, &host_num_patterns, sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(dictionary_patterns, host_dictionary_patterns, 1000 * sizeof(uint64_t)));
+        gpu_assert(cudaMemcpyToSymbol(dictionary_bytes, host_dictionary_bytes, 1000 * sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(num_dictionary_patterns, &host_num_dictionary_patterns, sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(use_dictionary, &host_use_dictionary, sizeof(bool)));
     }
     
     gpu_assert(cudaDeviceSynchronize())
@@ -886,7 +888,8 @@ int main(int argc, char *argv[]) {
     std::vector<std::thread> threads;
     uint64_t global_start_time = milliseconds();
     for (int i = 0; i < num_devices; i++) {
-        std::thread th(host_thread, device_ids[i], i, score_method, mode, origin_address, deployer_address, bytecode_hash);
+        std::thread th(host_thread, device_ids[i], i, score_method, mode, origin_address, deployer_address, bytecode_hash,
+                        pattern_values, pattern_bytes, num_patterns, dictionary_patterns, dictionary_bytes, num_dictionary_patterns, use_dictionary);
         threads.push_back(move(th));
     }
 
